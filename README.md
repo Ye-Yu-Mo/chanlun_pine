@@ -1,12 +1,24 @@
 # 缠论核心 Chanlun Core — 使用指南
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![GitHub](https://img.shields.io/badge/GitHub-Ye--Yu--Mo%2Fchanlun__pine-brightgreen?logo=github)](https://github.com/Ye-Yu-Mo/chanlun_pine)
+
 ## 快速开始
+
+**方式一：直接粘贴（推荐新手）**
 
 1. 打开 [TradingView](https://www.tradingview.com)
 2. 打开任意 A 股（如 `SSE:510050`）或台股（如 `TWSE:2330`）图表
 3. 点击底部 **Pine 编辑器** 标签
 4. 粘贴 `chanlun_core.pine` 全部代码
 5. 点击 **添加到图表**
+
+**方式二：Git Clone（推荐开发者）**
+
+```bash
+git clone https://github.com/Ye-Yu-Mo/chanlun_pine.git
+```
+然后将 `chanlun_core.pine` 内容粘贴到 TradingView Pine 编辑器。
 
 首次加载后，在底部 **Pine 日志** 面板可以看到统计信息：
 
@@ -176,3 +188,26 @@ A: ① 减少图表 K 线数量（设置 → 图表属性 → 最大 K 线数）
 ## 免责声明
 
 本脚本仅供技术分析学习和研究使用，**不构成任何投资建议**。缠论信号是基于历史数据的概率判断，不保证未来走势。交易决策请结合自身风险承受能力和资金管理策略。
+
+---
+
+## 许可证
+
+本项目采用 **GNU General Public License v3.0 (GPL-3.0)** 许可证。
+
+- ✅ 您可以自由使用、修改和分发本项目的代码
+- ✅ 您可以用于商业用途
+- ⚠️ **但如果您修改了代码并分发（包括发布到 TradingView），必须同样以 GPL-3.0 开源您的修改**
+- ⚠️ 分发时必须保留原始版权声明和许可证
+
+详见 [LICENSE](LICENSE) 文件。
+
+---
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request：
+
+- 🐛 [报告 Bug](https://github.com/Ye-Yu-Mo/chanlun_pine/issues)
+- 💡 [功能建议](https://github.com/Ye-Yu-Mo/chanlun_pine/issues)
+- 🔧 [提交 PR](https://github.com/Ye-Yu-Mo/chanlun_pine/pulls)
