@@ -155,6 +155,7 @@ type Prediction
     string description
     string direction
     string statusText
+    float  stopLoss       // M3: 参考止损价格（na = 未计算）
 
 // ============================================================
 // INPUT PARAMETERS
@@ -207,6 +208,17 @@ bool showPredictionInput = input.bool(true, "显示预判面板", group="预判�
     tooltip="在图表右上角显示实时预判表格，仅在盘中实时K线时更新")
 float alertThresholdInput = input.float(0.5, "告警价格偏差 (%)", minval=0.1, maxval=5.0, step=0.1, group="预判设置",
     tooltip="当前价与触发价的偏差小于此值时触发告警")
+
+// --- 止损设置 (M3) ---
+bool  showStopLossInput           = input.bool(true,  "显示止损信息", group="止损设置",
+    tooltip="在信号标签和预判面板中显示参考止损位。关闭后与 v0.8.0 行为一致")
+int   stopLossAtrPeriodInput      = input.int(14,   "ATR 周期", minval=5, maxval=50, group="止损设置",
+    tooltip="用于计算动态止损距离的 ATR 周期。14=约三周日线波动率")
+float stopLossAtrMultiplierInput  = input.float(1.5, "ATR 倍数", minval=0.5, maxval=5.0, step=0.1, group="止损设置",
+    tooltip="止损距离 = max(ATR×倍数, 价格×2%)。倍数越大止损越宽")
+
+// ATR 系列（M3 止损计算用，全局作用域，函数内可直接引用）
+float atrCurrent = ta.atr(stopLossAtrPeriodInput)
 
 // ============================================================
 // 功能1: 包含判断 - hasContainment()
@@ -970,6 +982,39 @@ isSignalTriggered(sType, strokeIdx, signals) =>
     result
 
 // ============================================================
+// 功能12c: 止损计算 - getStopLossForSignal()
+// ============================================================
+
+// @function  计算信号对应的参考止损价格
+// @param     sType SignalType - 信号类型
+// @param     entryPrice float - 进场价格（信号触发价）
+// @param     refPrice float - 参考价格（B2=对应 B1 价格, S2=对应 S1 价格, na=不适用）
+// @param     zd float - 中枢下沿 ZD（B3 止损用, na=不适用）
+// @param     zg float - 中枢上沿 ZG（S3 止损用, na=不适用）
+// @param     atrValue float - 当前 ATR 值（用于 B1/S1 动态止损距离）
+// @returns   float - 参考止损价格（na = 无法计算）
+//
+// 止损规则：
+// - B1: entryPrice - max(ATR×倍数, 2%)  ← 动态波动率 + 百分比兜底
+// - B2: refPrice（B1 的低点）           ← 不破 B1 前低
+// - B3: zd（中枢下沿）                   ← 不破中枢下沿
+// - S1: entryPrice + max(ATR×倍数, 2%)  ← B1 的镜像
+// - S2: refPrice（S1 的高点）           ← 不破 S1 前高
+// - S3: zg（中枢上沿）                   ← 不破中枢上沿
+getStopLossForSignal(sType, entryPrice, refPrice, zd, zg, atrValue) =>
+    atrDist  = atrValue * stopLossAtrMultiplierInput
+    pctDist  = entryPrice * 0.02
+    stopDist = math.max(atrDist, pctDist)
+
+    switch sType
+        SignalType.B1 => entryPrice - stopDist
+        SignalType.B2 => na(refPrice) ? entryPrice - pctDist : refPrice
+        SignalType.B3 => na(zd) ? entryPrice - pctDist : zd
+        SignalType.S1 => entryPrice + stopDist
+        SignalType.S2 => na(refPrice) ? entryPrice + pctDist : refPrice
+        SignalType.S3 => na(zg) ? entryPrice + pctDist : zg
+
+// ============================================================
 // 功能13: 实时预判计算 - computePredictions()
 // ============================================================
 
@@ -1024,7 +1069,8 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
                           "B1", triggerPrice,
                           str.format("跌破前低{0,number,#.##} + MACD背驰 → B1", triggerPrice),
                           "DOWN",
-                          statusText
+                          statusText,
+                          getStopLossForSignal(SignalType.B1, triggerPrice, float(na), float(na), float(na), atrCurrent)
                         ))
                         b1PredictionGenerated := true
 
@@ -1039,7 +1085,8 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
                       "B1", triggerPrice,
                       str.format("向下离开中枢 + 跌破{0,number,#.##} + MACD背驰 → B1", triggerPrice),
                       "DOWN",
-                      "⏳ 形成中"
+                      "⏳ 形成中",
+                      getStopLossForSignal(SignalType.B1, triggerPrice, float(na), float(na), float(na), atrCurrent)
                     ))
                     b1PredictionGenerated := true
 
@@ -1074,7 +1121,8 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
                           "S1", triggerPrice,
                           str.format("突破前高{0,number,#.##} + MACD背驰 → S1", triggerPrice),
                           "UP",
-                          statusText
+                          statusText,
+                          getStopLossForSignal(SignalType.S1, triggerPrice, float(na), float(na), float(na), atrCurrent)
                         ))
 
                 // realtime 感知：价格已向上突破 ZG，离开段正在形成
@@ -1084,7 +1132,8 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
                           "S1", refStroke.endPrice,
                           str.format("向上离开中枢 + 突破{0,number,#.##} + MACD背驰 → S1", refStroke.endPrice),
                           "UP",
-                          "⏳ 形成中"
+                          "⏳ 形成中",
+                          getStopLossForSignal(SignalType.S1, refStroke.endPrice, float(na), float(na), float(na), atrCurrent)
                         ))
 
     // --- B3: 中枢上方三买预判 ---
@@ -1111,7 +1160,8 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
                   "B3", lastZS.zg,
                   str.format("回调不破ZG={0,number,#.##} → B3", lastZS.zg),
                   "DOWN",
-                  statusText
+                  statusText,
+                  getStopLossForSignal(SignalType.B3, lastZS.zg, float(na), lastZS.zd, lastZS.zg, atrCurrent)
                 ))
 
             // S3: 向下离开 + 价格仍在 ZD 下方
@@ -1126,7 +1176,8 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
                   "S3", lastZS.zd,
                   str.format("反弹不破ZD={0,number,#.##} → S3", lastZS.zd),
                   "UP",
-                  statusText
+                  statusText,
+                  getStopLossForSignal(SignalType.S3, lastZS.zd, float(na), lastZS.zd, lastZS.zg, atrCurrent)
                 ))
 
     // --- B2: B1 后的二次买入预判 ---
@@ -1151,7 +1202,8 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
                           "B2", sig.price,
                           str.format("回踩不破B1={0,number,#.##} → B2", sig.price),
                           "DOWN",
-                          statusText
+                          statusText,
+                          getStopLossForSignal(SignalType.B2, sig.price, sig.price, float(na), float(na), atrCurrent)
                         ))
             break
         i := i - 1
@@ -1178,7 +1230,8 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
                           "S2", sig.price,
                           str.format("反弹不破S1={0,number,#.##} → S2", sig.price),
                           "UP",
-                          statusText
+                          statusText,
+                          getStopLossForSignal(SignalType.S2, sig.price, sig.price, float(na), float(na), atrCurrent)
                         ))
             break
         i := i - 1
@@ -1575,10 +1628,39 @@ if needFullRebuild
 
         sigStyle = isBuy ? label.style_label_up : label.style_label_down
 
+        // M3: 计算止损价
+        float slPrice = na
+        if showStopLossInput
+            refPrice = switch sig.sType
+                SignalType.B2 =>
+                    float b1Price = na
+                    for fs in firstSignals
+                        if fs.sType == SignalType.B1 and fs.refIndex == sig.refIndex
+                            b1Price := fs.price
+                            break
+                    b1Price
+                SignalType.S2 =>
+                    float s1Price = na
+                    for fs in firstSignals
+                        if fs.sType == SignalType.S1 and fs.refIndex == sig.refIndex
+                            s1Price := fs.price
+                            break
+                    s1Price
+                => float(na)
+
+            zd = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).zd : na
+            zg = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).zg : na
+
+            slPrice := getStopLossForSignal(sig.sType, sig.price, refPrice, zd, zg, atrCurrent)
+
+        labelText = sig.description
+        if showStopLossInput and not na(slPrice)
+            labelText := str.format("{0}\n止损 {1,number,#.##}", sig.description, slPrice)
+
         sigLabel = label.new(
           sigTime,
           sigPrice,
-          sig.description,
+          labelText,
           color=sigColor,
           textcolor=color.white,
           style=sigStyle,
@@ -1646,7 +1728,7 @@ if barstate.isrealtime
 // 用 table.new() 在图表右上角创建固定列表格。
 // 只在 barstate.isrealtime 时更新内容，历史 bar 不显示。
 // 预分配 7 行 × 5 列（1 表头 + 最多 6 条预判），Pine Script 不支持动态 resize。
-var table predictTable = table.new(position.top_right, 5, 7,
+var table predictTable = table.new(position.top_right, 7, 7,
     border_width=1, border_color=color.gray,
     frame_width=1, frame_color=color.gray,
     bgcolor=color.new(color.black, 90))
@@ -1654,12 +1736,14 @@ var table predictTable = table.new(position.top_right, 5, 7,
 if showPredictionInput and barstate.isrealtime
     // 使用缓存的预判结果（已在统一入口计算）
 
-    // 表头
+    // 表头（列 4/5 在 showStopLossInput=false 时留空，视觉退化为 5 列）
     table.cell(predictTable, 0, 0, "信号",   text_color=color.white, bgcolor=color.gray)
-    table.cell(predictTable, 0, 1, "触发价", text_color=color.white, bgcolor=color.gray)
-    table.cell(predictTable, 0, 2, "当前价", text_color=color.white, bgcolor=color.gray)
-    table.cell(predictTable, 0, 3, "距离%",  text_color=color.white, bgcolor=color.gray)
-    table.cell(predictTable, 0, 4, "触发条件", text_color=color.white, bgcolor=color.gray)
+    table.cell(predictTable, 1, 0, "触发价", text_color=color.white, bgcolor=color.gray)
+    table.cell(predictTable, 2, 0, "当前价", text_color=color.white, bgcolor=color.gray)
+    table.cell(predictTable, 3, 0, "距离%",  text_color=color.white, bgcolor=color.gray)
+    table.cell(predictTable, 4, 0, showStopLossInput ? "止损位"  : "", text_color=color.white, bgcolor=showStopLossInput ? color.gray : color.new(color.black, 90))
+    table.cell(predictTable, 5, 0, showStopLossInput ? "距止损%" : "", text_color=color.white, bgcolor=showStopLossInput ? color.gray : color.new(color.black, 90))
+    table.cell(predictTable, 6, 0, "触发条件", text_color=color.white, bgcolor=color.gray)
 
     // 填充预判行（最多 6 行）
     maxRows = math.min(cachedPredictions.size(), 6)
@@ -1682,14 +1766,33 @@ if showPredictionInput and barstate.isrealtime
               text_color=color.white, bgcolor=rowColor)
             table.cell(predictTable, 3, row + 1, distText,
               text_color=distColor, bgcolor=rowColor)
+
+            // 列 4: 止损位
+            if showStopLossInput and not na(p.stopLoss)
+                table.cell(predictTable, 4, row + 1, str.tostring(math.round_to_mintick(p.stopLoss)),
+                  text_color=color.white, bgcolor=rowColor)
+            else
+                table.cell(predictTable, 4, row + 1, "", bgcolor=color.new(color.black, 90))
+
+            // 列 5: 距止损%
+            if showStopLossInput and not na(p.stopLoss)
+                slDist = (currentPrice - p.stopLoss) / currentPrice * 100.0
+                slDistText = str.format("{0,number,#.#}%", slDist)
+                slDistColor = slDist > 0 ? color.green : color.red
+                table.cell(predictTable, 5, row + 1, slDistText,
+                  text_color=slDistColor, bgcolor=rowColor)
+            else
+                table.cell(predictTable, 5, row + 1, "", bgcolor=color.new(color.black, 90))
+
+            // 列 6: 触发条件（原列 4）
             condText = str.format("{0} {1}", p.statusText, p.description)
-            table.cell(predictTable, 4, row + 1, condText,
+            table.cell(predictTable, 6, row + 1, condText,
               text_color=color.white, bgcolor=rowColor)
 
-    // 清空未使用行
+    // 清空未使用行（适配 7 列）
     if maxRows <= 5
         for row = maxRows to 5
-            for col = 0 to 4
+            for col = 0 to 6
                 table.cell(predictTable, col, row + 1, "", bgcolor=color.new(color.black, 90))
 
 // --- 5c. Alert 告警条件 ---
