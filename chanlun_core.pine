@@ -1727,7 +1727,7 @@ if barstate.isrealtime
 // --- 5b. 实时预判面板（表格）---
 // 用 table.new() 在图表右上角创建固定列表格。
 // 只在 barstate.isrealtime 时更新内容，历史 bar 不显示。
-// 预分配 7 行 × 5 列（1 表头 + 最多 6 条预判），Pine Script 不支持动态 resize。
+// 预分配 7 行 × 7 列（1 表头 + 最多 6 条预判），Pine Script 不支持动态 resize。
 var table predictTable = table.new(position.top_right, 7, 7,
     border_width=1, border_color=color.gray,
     frame_width=1, frame_color=color.gray,
