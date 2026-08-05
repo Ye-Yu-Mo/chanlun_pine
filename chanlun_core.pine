@@ -1047,6 +1047,10 @@ var array<TradingSignal> firstSignals        = array.new<TradingSignal>()  // �
 var array<TradingSignal> thirdSignals        = array.new<TradingSignal>()  // 第三类买卖点 B3/S3
 var array<TradingSignal> secondSignals       = array.new<TradingSignal>()  // 第二类买卖点 B2/S2
 var array<TradingSignal> allFilteredSignals  = array.new<TradingSignal>()  // 过滤后的所有买卖点
+var array<label>     fractalLabels      = array.new<label>()       // 分型文字标签（跟踪生命周期，防止泄漏）
+var array<label>     debugMergeLabels   = array.new<label>()       // 调试模式"X合"标签（跟踪生命周期，防止泄漏）
+var array<Prediction> cachedPredictions  = array.new<Prediction>() // 预判结果缓存（面板和告警复用）
+var bool             predictionsCached  = false                   // 当前 bar 是否已有缓存
 
 // --- 增量包含处理（每根已确认K线执行，O(1)摊销）---
 if barstate.isconfirmed
@@ -1422,6 +1426,60 @@ if needFullRebuild
         )
         signalLabels.push(sigLabel)
 
+// --- 4c. 分型文字标签 ---
+// 策略：与笔线/中枢/背驰/信号标签一致，needFullRebuild 时删除重建。
+// plotshape 三角标记保持声明式（不泄漏）。
+if needFullRebuild
+    for oldLabel in fractalLabels
+        oldLabel.delete()
+    fractalLabels.clear()
+
+    for f in fractals
+        fTime = barTimes.get(f.originalIndex)
+        if f.fType == FractalType.TOP
+            fractalLabels.push(label.new(
+              fTime, f.price,
+              "顶",
+              style=label.style_label_down,
+              color=color.red,
+              textcolor=color.white,
+              size=size.small,
+              xloc=xloc.bar_time,
+              yloc=yloc.abovebar
+            ))
+        else if f.fType == FractalType.BOTTOM
+            fractalLabels.push(label.new(
+              fTime, f.price,
+              "底",
+              style=label.style_label_up,
+              color=color.green,
+              textcolor=color.white,
+              size=size.small,
+              xloc=xloc.bar_time,
+              yloc=yloc.belowbar
+            ))
+
+// 清理调试标签：每次 needFullRebuild 时清空旧标签。
+// 注意：清空后历史 bar 的调试标签不会自动重建（per-bar 逻辑只对当前 bar_index 生效），
+// 这是调试模式的已知限制——关闭并重新开启调试模式即可恢复完整显示。
+if needFullRebuild
+    for oldLabel in debugMergeLabels
+        oldLabel.delete()
+    debugMergeLabels.clear()
+
+// --- 预判计算（统一入口，每次实时 bar 计算一次，面板和告警复用）---
+if barstate.isrealtime
+    // barstate.isnew：每个新 bar 的第一次执行时为 true，用于跨 bar 缓存失效
+    if barstate.isnew
+        predictionsCached := false
+
+    if not predictionsCached
+        cachedPredictions.clear()
+        newPredictions = computePredictions(strokes, zhongShuList, trendBeiChiSignals, allFilteredSignals)
+        for p in newPredictions
+            cachedPredictions.push(p)
+        predictionsCached := true
+
 // --- 5b. 实时预判面板（表格）---
 // 用 table.new() 在图表右上角创建固定列表格。
 // 只在 barstate.isrealtime 时更新内容，历史 bar 不显示。
@@ -1432,7 +1490,7 @@ var table predictTable = table.new(position.top_right, 5, 7,
     bgcolor=color.new(color.black, 90))
 
 if showPredictionInput and barstate.isrealtime
-    predictions = computePredictions(strokes, zhongShuList, trendBeiChiSignals, allFilteredSignals)
+    // 使用缓存的预判结果（已在统一入口计算）
 
     // 表头
     table.cell(predictTable, 0, 0, "信号",   text_color=color.white, bgcolor=color.gray)
@@ -1442,9 +1500,9 @@ if showPredictionInput and barstate.isrealtime
     table.cell(predictTable, 0, 4, "触发条件", text_color=color.white, bgcolor=color.gray)
 
     // 填充预判行（最多 6 行）
-    maxRows = math.min(predictions.size(), 6)
+    maxRows = math.min(cachedPredictions.size(), 6)
     for row = 0 to maxRows - 1
-        p = predictions.get(row)
+        p = cachedPredictions.get(row)
         currentPrice = close
         dist = (p.triggerPrice - currentPrice) / currentPrice * 100.0
         distText = str.format("{0,number,#.#}%", dist)
@@ -1474,8 +1532,7 @@ if showPredictionInput and barstate.isrealtime
 // 在当前价接近任意预判触发价时发送告警。
 // alert.freq_once_per_bar_close 确保每根 bar 每种信号最多告警一次。
 if barstate.isrealtime
-    alertPredictions = computePredictions(strokes, zhongShuList, trendBeiChiSignals, allFilteredSignals)
-    for p in alertPredictions
+    for p in cachedPredictions
         distPct = math.abs(close - p.triggerPrice) / p.triggerPrice * 100.0
         if distPct <= alertThresholdInput
             alert(
@@ -1503,31 +1560,6 @@ for f in fractals
 
 plotshape(isTopFractal, "顶分型", shape.triangledown, location.abovebar, color.red, size=size.small, offset=0)
 plotshape(isBottomFractal, "底分型", shape.triangleup, location.belowbar, color.green, size=size.small, offset=0)
-
-// 分型文字标签：只在已确认K线上创建，避免实时tick重复创建label对象
-if isTopFractal and barstate.isconfirmed
-    label.new(
-      bar_index,
-      high,
-      "顶",
-      style=label.style_label_down,
-      color=color.red,
-      textcolor=color.white,
-      size=size.small,
-      yloc=yloc.abovebar
-    )
-
-if isBottomFractal and barstate.isconfirmed
-    label.new(
-      bar_index,
-      low,
-      "底",
-      style=label.style_label_up,
-      color=color.green,
-      textcolor=color.white,
-      size=size.small,
-      yloc=yloc.belowbar
-    )
 
 // --- 8. 调试模式：包含处理前后对比 ---
 // 关闭调试模式时，所有辅助元素隐藏，不影响正常看图
@@ -1563,7 +1595,7 @@ if showContainmentDebug and bar_index < mergedCountMap.size()
         // 判断是否为最后一根：检查下一根 bar 的 mergeCount 是否与当前相同
         isLastOfMerge = bar_index + 1 >= mergedCountMap.size() or mergedCountMap.get(bar_index + 1) != mergedCnt
         if isLastOfMerge
-            label.new(
+            newDbgLabel = label.new(
               bar_index,
               mergedHighMap.get(bar_index),
               str.format("{0}合", mergedCnt),
@@ -1572,6 +1604,7 @@ if showContainmentDebug and bar_index < mergedCountMap.size()
               style=label.style_label_down,
               size=size.small
             )
+            debugMergeLabels.push(newDbgLabel)
 
 bgcolor(isMergedBarBg ? color.new(color.orange, 88) : na, title="被合并K线")
 
