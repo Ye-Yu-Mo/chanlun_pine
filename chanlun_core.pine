@@ -1878,10 +1878,11 @@ if needFullRebuild
         oldLabel.delete()
     debugMergeLabels.clear()
 
-// --- 预判计算（统一入口，每次实时 bar 计算一次，面板和告警复用）---
-if barstate.isrealtime
-    // barstate.isnew：每个新 bar 的第一次执行时为 true，用于跨 bar 缓存失效
-    if barstate.isnew
+// --- 预判计算（统一入口：实时 bar 首次 tick + 历史加载完成时各算一次，面板和告警复用）---
+if barstate.isrealtime or barstate.islastconfirmedhistory
+    // barstate.isnew：每个新 bar 首次执行为 true；barstate.islastconfirmedhistory：历史加载完成
+    // 缓存失效仅由这两个事件触发，删除了原来的 else 重置分支
+    if barstate.isnew or barstate.islastconfirmedhistory
         predictionsCached := false
 
     if not predictionsCached
@@ -1893,18 +1894,23 @@ if barstate.isrealtime
 
 // --- 5b. 实时预判面板（表格）---
 // 用 table.new() 在图表右上角创建固定列表格。
-// 只在 barstate.isrealtime 时更新内容，历史 bar 不显示。
-// 预分配 7 行 × 7 列（1 表头 + 最多 6 条预判），Pine Script 不支持动态 resize。
-var table predictTable = table.new(position.top_right, 7, 7,
+// 在实时 bar 和历史加载完成时显示。非交易时段使用缓存数据。
+// 预分配 7 列 × 8 行（1 表头 + 6 数据行 + 1 时间戳行），Pine Script 不支持动态 resize。
+var table predictTable = table.new(position.top_right, 7, 8,
     border_width=1, border_color=color.gray,
     frame_width=1, frame_color=color.gray,
     bgcolor=color.new(color.black, 90))
 
-if showPredictionInput and barstate.isrealtime
+// 面板显示条件：实时 bar + 历史加载完成时
+showPanel = showPredictionInput and (barstate.isrealtime or barstate.islastconfirmedhistory)
+isNonTrading = showPanel and not barstate.isrealtime
+
+if showPanel
     // 使用缓存的预判结果（已在统一入口计算）
 
     // 表头（列 4/5 在 showStopLossInput=false 时留空，视觉退化为 5 列）
-    table.cell(predictTable, 0, 0, "信号",   text_color=color.white, bgcolor=color.gray)
+    headerSignalText = isNonTrading ? "信号 [非交易时段]" : "信号"
+    table.cell(predictTable, 0, 0, headerSignalText, text_color=color.white, bgcolor=color.gray)
     table.cell(predictTable, 1, 0, "触发价", text_color=color.white, bgcolor=color.gray)
     table.cell(predictTable, 2, 0, "当前价", text_color=color.white, bgcolor=color.gray)
     table.cell(predictTable, 3, 0, "距离%",  text_color=color.white, bgcolor=color.gray)
@@ -1918,19 +1924,31 @@ if showPredictionInput and barstate.isrealtime
         for row = 0 to maxRows - 1
             p = cachedPredictions.get(row)
             currentPrice = close
-            dist = (p.triggerPrice - currentPrice) / currentPrice * 100.0
-            distText = str.format("{0,number,#.#}%", dist)
 
             isBuy = p.signalType == "B1" or p.signalType == "B2" or p.signalType == "B3"
             rowColor = isBuy ? color.new(color.green, 80) : color.new(color.red, 80)
-            distColor = dist > 0 ? color.green : color.red
 
             table.cell(predictTable, 0, row + 1, p.signalType,
               text_color=color.white, bgcolor=rowColor)
             table.cell(predictTable, 1, row + 1, str.tostring(math.round_to_mintick(p.triggerPrice)),
               text_color=color.white, bgcolor=rowColor)
-            table.cell(predictTable, 2, row + 1, str.tostring(math.round_to_mintick(currentPrice)),
+
+            // 列 2: 当前价（非交易时段标注"收盘"）
+            string priceText = str.tostring(math.round_to_mintick(currentPrice))
+            if isNonTrading
+                priceText := str.format("{0} (收盘)", priceText)
+            table.cell(predictTable, 2, row + 1, priceText,
               text_color=color.white, bgcolor=rowColor)
+
+            // 列 3: 距离%（非交易时段显示 --）
+            string distText = ""
+            color  distColor = color.gray
+            if isNonTrading
+                distText := "--"
+            else
+                dist = (p.triggerPrice - currentPrice) / currentPrice * 100.0
+                distText := str.format("{0,number,#.#}%", dist)
+                distColor := dist > 0 ? color.green : color.red
             table.cell(predictTable, 3, row + 1, distText,
               text_color=distColor, bgcolor=rowColor)
 
@@ -1956,11 +1974,20 @@ if showPredictionInput and barstate.isrealtime
             table.cell(predictTable, 6, row + 1, condText,
               text_color=color.white, bgcolor=rowColor)
 
-    // 清空未使用行（适配 7 列）
+    // 清空未使用预测行（row 1-6，透明背景不遮挡图表）
     if maxRows <= 5
         for row = maxRows to 5
             for col = 0 to 6
-                table.cell(predictTable, col, row + 1, "", bgcolor=color.new(color.black, 90))
+                table.cell(predictTable, col, row + 1, "", bgcolor=na)
+
+    // 更新时间戳行（row 7，永远填充，不需要清理）
+    string timeText = str.format("更新: {0,time,HH:mm:ss}", timenow)
+    if isNonTrading
+        timeText := str.format("更新: {0,time,yyyy-MM-dd HH:mm}", time_close)
+    table.cell(predictTable, 0, 7, timeText,
+      text_color=color.new(color.white, 70), bgcolor=color.new(color.black, 70))
+    for col = 1 to 6
+        table.cell(predictTable, col, 7, "", bgcolor=color.new(color.black, 70))
 
 // --- 5c. Alert 告警条件 ---
 // 在当前价接近任意预判触发价时发送告警。
