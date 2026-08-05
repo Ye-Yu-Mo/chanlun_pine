@@ -148,11 +148,13 @@ type TradingSignal
 // @field triggerPrice 触发价格阈值
 // @field description  触发条件描述
 // @field direction    价格需要突破的方向 ("UP"/"DOWN")
+// @field statusText   预判生命周期状态："⏳ 等待中" / "⏳ 观察背驰" / "⏳ 形成中" / "✅ 已触发" / "❌ 已失效"
 type Prediction
     string signalType
     float  triggerPrice
     string description
     string direction
+    string statusText
 
 // ============================================================
 // INPUT PARAMETERS
@@ -160,6 +162,7 @@ type Prediction
 
 // 调试开关：显示包含处理过程
 bool showContainmentDebug = input.bool(false, "显示包含处理过程", group="调试", tooltip="开启后高亮被合并的K线，显示合并前后对比")
+bool showFractalLabels    = input.bool(true,  "显示分型文字标签",  group="调试", tooltip="显示顶/底分型的文字标签。关闭后只保留三角标记")
 
 // --- 笔设置 (M2) ---
 int   minBarsForBiInput     = input.int(3,    "笔最少K线数 (含分型)", minval=2, maxval=10, group="笔设置",
@@ -642,7 +645,22 @@ detectTrendBeiChi(strokes, zhongShuList, histValues, areaRatioThreshold) =>
         if inZS.get(k) == 0
             trendIndices.push(k)
 
-    // Step 3: 跨中枢比较同向趋势笔对
+    // Step 3: 预计算"两笔间是否有中枢"的 O(1) 查询表
+    // firstZSAfter[i] = zhongShuList 中第一个 startStrokeIdx > i 的中枢索引（-1 表示无）
+    firstZSAfter = array.new<int>()
+    for k = 0 to n - 1
+        firstZSAfter.push(-1)
+
+    zsIdx = 0
+    zsN = zhongShuList.size()
+    for k = 0 to n - 1
+        while zsIdx < zsN and zhongShuList.get(zsIdx).startStrokeIdx <= k
+            zsIdx := zsIdx + 1
+        if zsIdx < zsN
+            firstZSAfter.set(k, zsIdx)
+
+    // Step 4: 跨中枢比较同向趋势笔对
+    // 用预计算表替代原来的内层 O(z) 中枢扫描，总复杂度 O(m²) 每对 O(1)
     m = trendIndices.size()
     if m < 2
         signals
@@ -659,12 +677,9 @@ detectTrendBeiChi(strokes, zhongShuList, histValues, areaRatioThreshold) =>
             if a.dir != b.dir
                 continue
 
-            // 必须隔至少一个完整的中枢
-            hasZS = false
-            for zs in zhongShuList
-                if zs.startStrokeIdx > aIdx and zs.endStrokeIdx < bIdx
-                    hasZS := true
-                    break
+            // O(1) 中枢检查：a 之后第一个中枢的 endStrokeIdx 是否小于 bIdx
+            zsAfterA = firstZSAfter.get(aIdx)
+            hasZS = zsAfterA >= 0 and zhongShuList.get(zsAfterA).endStrokeIdx < bIdx
             if not hasZS
                 continue
 
@@ -938,6 +953,23 @@ filterSignalSpacing(signals, minBarsBetween) =>
     filtered
 
 // ============================================================
+// 功能12b: 信号触发状态查询 - isSignalTriggered()
+// ============================================================
+
+// @function  检查指定类型的信号是否已在给定笔上触发
+// @param     sType SignalType - 要查询的信号类型
+// @param     strokeIdx int - 目标笔在 strokes 中的索引
+// @param     signals array<TradingSignal> - 已过滤的信号数组
+// @returns   bool - true = 该笔上已有对应信号触发
+isSignalTriggered(sType, strokeIdx, signals) =>
+    result = false
+    for sig in signals
+        if sig.sType == sType and sig.refIndex == strokeIdx
+            result := true
+            break
+    result
+
+// ============================================================
 // 功能13: 实时预判计算 - computePredictions()
 // ============================================================
 
@@ -950,75 +982,204 @@ filterSignalSpacing(signals, minBarsBetween) =>
 computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
     predictions = array.new<Prediction>()
 
-    // --- B1: 最近底背驰的离开段低点 ---
-    i = trendBCSignals.size() - 1
-    while i >= 0
-        bc = trendBCSignals.get(i)
-        if bc.bcType == BeiChiType.BOTTOM
-            bcStroke = strokes.get(bc.strokeIndex)
-            predictions.push(Prediction.new(
-              "B1", bcStroke.endPrice,
-              "新低+底背驰 → B1",
-              "DOWN"
-            ))
-            break
-        i := i - 1
+    // --- B1: 趋势底背驰买点预判 ---
+    // 结构条件：最后一个中枢前有向下的进入段 + 中枢后有向下的离开段
+    // 触发阈值：离开段跌破进入段终点 → 配合 MACD 背驰确认 → B1
+    // 算法：
+    //   1. 找到最后一个中枢 lastZS
+    //   2. 进入段参考笔 = strokes[lastZS.startStrokeIdx - 1]（中枢之前的那笔趋势笔，方向必须 DOWN）
+    //   3. 离开段 = strokes.last()（方向必须 DOWN，且在中枢之后）
+    //   4. 触发价 = refStroke.endPrice（参考前低）
+    //   5. 状态：已触发（B1 已生成）/ 观察背驰（已跌破前低）/ 等待中（价格在前低上方）
+    b1PredictionGenerated = false
 
-    // --- S1: 最近顶背驰的离开段高点 ---
-    i := trendBCSignals.size() - 1
-    while i >= 0
-        bc = trendBCSignals.get(i)
-        if bc.bcType == BeiChiType.TOP
-            bcStroke = strokes.get(bc.strokeIndex)
-            predictions.push(Prediction.new(
-              "S1", bcStroke.endPrice,
-              "新高+顶背驰 → S1",
-              "UP"
-            ))
-            break
-        i := i - 1
-
-    // --- B3: 最近中枢的 ZG ---
     if zhongShuList.size() > 0
         lastZS = zhongShuList.get(zhongShuList.size() - 1)
-        predictions.push(Prediction.new(
-          "B3", lastZS.zg,
-          str.format("回调不破ZG={0,number,#.##} → B3", lastZS.zg),
-          "DOWN"
-        ))
 
-    // --- S3: 最近中枢的 ZD ---
+        // Step 1: 定位进入段参考笔（中枢开始之前的那笔趋势笔，必须向下）
+        if lastZS.startStrokeIdx > 0
+            refStrokeIdx = lastZS.startStrokeIdx - 1
+            refStroke = strokes.get(refStrokeIdx)
+
+            if refStroke.dir == StrokeDirection.DOWN
+                // Step 2: 定位离开段（中枢之后的向下笔）
+                lastStrokeIdx = strokes.size() - 1
+
+                if lastStrokeIdx > lastZS.endStrokeIdx
+                    lastStroke = strokes.get(lastStrokeIdx)
+
+                    if lastStroke.dir == StrokeDirection.DOWN
+                        triggerPrice = refStroke.endPrice
+
+                        // Step 3: 判断状态
+                        statusText = ""
+                        if isSignalTriggered(SignalType.B1, lastStrokeIdx, allFilteredSignals)
+                            statusText := "✅ 已触发"
+                        else if close <= triggerPrice
+                            statusText := "⏳ 观察背驰"
+                        else
+                            statusText := "⏳ 等待中"
+
+                        predictions.push(Prediction.new(
+                          "B1", triggerPrice,
+                          str.format("跌破前低{0,number,#.##} + MACD背驰 → B1", triggerPrice),
+                          "DOWN",
+                          statusText
+                        ))
+                        b1PredictionGenerated := true
+
+        // Step 4: 离开段实时感知——最后一笔仍在中枢内，但实时价格已向下突破 ZD
+        if not b1PredictionGenerated
+            lastStrokeIdx = strokes.size() - 1
+            if lastStrokeIdx <= lastZS.endStrokeIdx and lastZS.startStrokeIdx > 0
+                refStroke = strokes.get(lastZS.startStrokeIdx - 1)
+                if refStroke.dir == StrokeDirection.DOWN and low < lastZS.zd
+                    triggerPrice = refStroke.endPrice
+                    predictions.push(Prediction.new(
+                      "B1", triggerPrice,
+                      str.format("向下离开中枢 + 跌破{0,number,#.##} + MACD背驰 → B1", triggerPrice),
+                      "DOWN",
+                      "⏳ 形成中"
+                    ))
+                    b1PredictionGenerated := true
+
+    // --- S1: 趋势顶背驰卖点预判（B1 的镜像）---
+    // 结构条件：最后一个中枢前有向上的进入段 + 中枢后有向上的离开段
+    // 触发阈值：离开段突破进入段终点 → 配合 MACD 背驰确认 → S1
     if zhongShuList.size() > 0
         lastZS = zhongShuList.get(zhongShuList.size() - 1)
-        predictions.push(Prediction.new(
-          "S3", lastZS.zd,
-          str.format("反弹不破ZD={0,number,#.##} → S3", lastZS.zd),
-          "UP"
-        ))
 
-    // --- B2: 最近 B1 的价格 ---
-    i := allFilteredSignals.size() - 1
+        if lastZS.startStrokeIdx > 0
+            refStrokeIdx = lastZS.startStrokeIdx - 1
+            refStroke = strokes.get(refStrokeIdx)
+
+            if refStroke.dir == StrokeDirection.UP
+                lastStrokeIdx = strokes.size() - 1
+
+                if lastStrokeIdx > lastZS.endStrokeIdx
+                    lastStroke = strokes.get(lastStrokeIdx)
+
+                    if lastStroke.dir == StrokeDirection.UP
+                        triggerPrice = refStroke.endPrice
+
+                        statusText = ""
+                        if isSignalTriggered(SignalType.S1, lastStrokeIdx, allFilteredSignals)
+                            statusText := "✅ 已触发"
+                        else if close >= triggerPrice
+                            statusText := "⏳ 观察背驰"
+                        else
+                            statusText := "⏳ 等待中"
+
+                        predictions.push(Prediction.new(
+                          "S1", triggerPrice,
+                          str.format("突破前高{0,number,#.##} + MACD背驰 → S1", triggerPrice),
+                          "UP",
+                          statusText
+                        ))
+
+                // realtime 感知：价格已向上突破 ZG，离开段正在形成
+                else if lastStrokeIdx <= lastZS.endStrokeIdx
+                    if high > lastZS.zg and refStroke.dir == StrokeDirection.UP
+                        predictions.push(Prediction.new(
+                          "S1", refStroke.endPrice,
+                          str.format("向上离开中枢 + 突破{0,number,#.##} + MACD背驰 → S1", refStroke.endPrice),
+                          "UP",
+                          "⏳ 形成中"
+                        ))
+
+    // --- B3: 中枢上方三买预判 ---
+    // 前件条件：中枢后第一笔向上离开 + 当前价仍在 ZG 上方
+    // --- S3: 中枢下方三卖预判 ---
+    // 前件条件：中枢后第一笔向下离开 + 当前价仍在 ZD 下方
+    if zhongShuList.size() > 0
+        zsIdx = zhongShuList.size() - 1
+        lastZS = zhongShuList.get(zsIdx)
+        leaveIdx = lastZS.endStrokeIdx + 1
+
+        if leaveIdx < strokes.size()
+            leaveStroke = strokes.get(leaveIdx)
+
+            // B3: 向上离开 + 价格仍在 ZG 上方
+            if leaveStroke.dir == StrokeDirection.UP and close > lastZS.zg
+                statusText = ""
+                if isSignalTriggered(SignalType.B3, zsIdx, allFilteredSignals)
+                    statusText := "✅ 已触发"
+                else
+                    statusText := "⏳ 等待中"
+
+                predictions.push(Prediction.new(
+                  "B3", lastZS.zg,
+                  str.format("回调不破ZG={0,number,#.##} → B3", lastZS.zg),
+                  "DOWN",
+                  statusText
+                ))
+
+            // S3: 向下离开 + 价格仍在 ZD 下方
+            if leaveStroke.dir == StrokeDirection.DOWN and close < lastZS.zd
+                statusText = ""
+                if isSignalTriggered(SignalType.S3, zsIdx, allFilteredSignals)
+                    statusText := "✅ 已触发"
+                else
+                    statusText := "⏳ 等待中"
+
+                predictions.push(Prediction.new(
+                  "S3", lastZS.zd,
+                  str.format("反弹不破ZD={0,number,#.##} → S3", lastZS.zd),
+                  "UP",
+                  statusText
+                ))
+
+    // --- B2: B1 后的二次买入预判 ---
+    // 前件条件：B1 后有向上反弹笔 + 当前价仍在 B1 价格上方
+    i = allFilteredSignals.size() - 1
     while i >= 0
         sig = allFilteredSignals.get(i)
         if sig.sType == SignalType.B1
-            predictions.push(Prediction.new(
-              "B2", sig.price,
-              str.format("回踩不破B1={0,number,#.##} → B2", sig.price),
-              "DOWN"
-            ))
+            b1RefIdx = sig.refIndex
+            reboundIdx = b1RefIdx + 1
+            if reboundIdx < strokes.size()
+                reboundStroke = strokes.get(reboundIdx)
+                if reboundStroke.dir == StrokeDirection.UP
+                    if close > sig.price
+                        statusText = ""
+                        if isSignalTriggered(SignalType.B2, b1RefIdx, allFilteredSignals)
+                            statusText := "✅ 已触发"
+                        else
+                            statusText := "⏳ 等待中"
+
+                        predictions.push(Prediction.new(
+                          "B2", sig.price,
+                          str.format("回踩不破B1={0,number,#.##} → B2", sig.price),
+                          "DOWN",
+                          statusText
+                        ))
             break
         i := i - 1
 
-    // --- S2: 最近 S1 的价格 ---
+    // --- S2: S1 后的二次卖出预判（B2 的镜像）---
+    // 前件条件：S1 后有向下回落笔 + 当前价仍在 S1 价格下方
     i := allFilteredSignals.size() - 1
     while i >= 0
         sig = allFilteredSignals.get(i)
         if sig.sType == SignalType.S1
-            predictions.push(Prediction.new(
-              "S2", sig.price,
-              str.format("反弹不破S1={0,number,#.##} → S2", sig.price),
-              "UP"
-            ))
+            s1RefIdx = sig.refIndex
+            reboundIdx = s1RefIdx + 1
+            if reboundIdx < strokes.size()
+                reboundStroke = strokes.get(reboundIdx)
+                if reboundStroke.dir == StrokeDirection.DOWN
+                    if close < sig.price
+                        statusText = ""
+                        if isSignalTriggered(SignalType.S2, s1RefIdx, allFilteredSignals)
+                            statusText := "✅ 已触发"
+                        else
+                            statusText := "⏳ 等待中"
+
+                        predictions.push(Prediction.new(
+                          "S2", sig.price,
+                          str.format("反弹不破S1={0,number,#.##} → S2", sig.price),
+                          "UP",
+                          statusText
+                        ))
             break
         i := i - 1
 
@@ -1434,30 +1595,31 @@ if needFullRebuild
         oldLabel.delete()
     fractalLabels.clear()
 
-    for f in fractals
-        fTime = barTimes.get(f.originalIndex)
-        if f.fType == FractalType.TOP
-            fractalLabels.push(label.new(
-              fTime, f.price,
-              "顶",
-              style=label.style_label_down,
-              color=color.red,
-              textcolor=color.white,
-              size=size.small,
-              xloc=xloc.bar_time,
-              yloc=yloc.abovebar
-            ))
-        else if f.fType == FractalType.BOTTOM
-            fractalLabels.push(label.new(
-              fTime, f.price,
-              "底",
-              style=label.style_label_up,
-              color=color.green,
-              textcolor=color.white,
-              size=size.small,
-              xloc=xloc.bar_time,
-              yloc=yloc.belowbar
-            ))
+    if showFractalLabels
+        for f in fractals
+            fTime = barTimes.get(f.originalIndex)
+            if f.fType == FractalType.TOP
+                fractalLabels.push(label.new(
+                  fTime, f.price,
+                  "顶",
+                  style=label.style_label_down,
+                  color=color.red,
+                  textcolor=color.white,
+                  size=size.small,
+                  xloc=xloc.bar_time,
+                  yloc=yloc.abovebar
+                ))
+            else if f.fType == FractalType.BOTTOM
+                fractalLabels.push(label.new(
+                  fTime, f.price,
+                  "底",
+                  style=label.style_label_up,
+                  color=color.green,
+                  textcolor=color.white,
+                  size=size.small,
+                  xloc=xloc.bar_time,
+                  yloc=yloc.belowbar
+                ))
 
 // 清理调试标签：每次 needFullRebuild 时清空旧标签。
 // 注意：清空后历史 bar 的调试标签不会自动重建（per-bar 逻辑只对当前 bar_index 生效），
@@ -1501,26 +1663,28 @@ if showPredictionInput and barstate.isrealtime
 
     // 填充预判行（最多 6 行）
     maxRows = math.min(cachedPredictions.size(), 6)
-    for row = 0 to maxRows - 1
-        p = cachedPredictions.get(row)
-        currentPrice = close
-        dist = (p.triggerPrice - currentPrice) / currentPrice * 100.0
-        distText = str.format("{0,number,#.#}%", dist)
+    if maxRows > 0
+        for row = 0 to maxRows - 1
+            p = cachedPredictions.get(row)
+            currentPrice = close
+            dist = (p.triggerPrice - currentPrice) / currentPrice * 100.0
+            distText = str.format("{0,number,#.#}%", dist)
 
-        isBuy = p.signalType == "B1" or p.signalType == "B2" or p.signalType == "B3"
-        rowColor = isBuy ? color.new(color.green, 80) : color.new(color.red, 80)
-        distColor = dist > 0 ? color.green : color.red
+            isBuy = p.signalType == "B1" or p.signalType == "B2" or p.signalType == "B3"
+            rowColor = isBuy ? color.new(color.green, 80) : color.new(color.red, 80)
+            distColor = dist > 0 ? color.green : color.red
 
-        table.cell(predictTable, 0, row + 1, p.signalType,
-          text_color=color.white, bgcolor=rowColor)
-        table.cell(predictTable, 1, row + 1, str.tostring(math.round_to_mintick(p.triggerPrice)),
-          text_color=color.white, bgcolor=rowColor)
-        table.cell(predictTable, 2, row + 1, str.tostring(math.round_to_mintick(currentPrice)),
-          text_color=color.white, bgcolor=rowColor)
-        table.cell(predictTable, 3, row + 1, distText,
-          text_color=distColor, bgcolor=rowColor)
-        table.cell(predictTable, 4, row + 1, p.description,
-          text_color=color.white, bgcolor=rowColor)
+            table.cell(predictTable, 0, row + 1, p.signalType,
+              text_color=color.white, bgcolor=rowColor)
+            table.cell(predictTable, 1, row + 1, str.tostring(math.round_to_mintick(p.triggerPrice)),
+              text_color=color.white, bgcolor=rowColor)
+            table.cell(predictTable, 2, row + 1, str.tostring(math.round_to_mintick(currentPrice)),
+              text_color=color.white, bgcolor=rowColor)
+            table.cell(predictTable, 3, row + 1, distText,
+              text_color=distColor, bgcolor=rowColor)
+            condText = str.format("{0} {1}", p.statusText, p.description)
+            table.cell(predictTable, 4, row + 1, condText,
+              text_color=color.white, bgcolor=rowColor)
 
     // 清空未使用行
     if maxRows <= 5
@@ -1533,6 +1697,10 @@ if showPredictionInput and barstate.isrealtime
 // alert.freq_once_per_bar_close 确保每根 bar 每种信号最多告警一次。
 if barstate.isrealtime
     for p in cachedPredictions
+        // 已触发的预判不再告警（信号标签已显示，无需重复提醒）
+        if p.statusText == "✅ 已触发"
+            continue
+
         distPct = math.abs(close - p.triggerPrice) / p.triggerPrice * 100.0
         if distPct <= alertThresholdInput
             alert(
