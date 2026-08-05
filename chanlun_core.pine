@@ -217,8 +217,21 @@ int   stopLossAtrPeriodInput      = input.int(14,   "ATR 周期", minval=5, maxv
 float stopLossAtrMultiplierInput  = input.float(1.5, "ATR 倍数", minval=0.5, maxval=5.0, step=0.1, group="止损设置",
     tooltip="止损距离 = max(ATR×倍数, 价格×2%)。倍数越大止损越宽")
 
+// --- 信号过滤设置 (M4) ---
+bool showSignalQualityInput = input.bool(true, "显示信号质量评分", group="信号过滤",
+    tooltip="在信号标签中显示 ★ 质量评分（0-100）。关闭后标签退化为 M3 样式")
+int  minSignalQualityInput  = input.int(0,   "最低信号质量", minval=0, maxval=100, group="信号过滤",
+    tooltip="只显示评分 ≥ 此值的信号。0=不过滤，80=仅高质量信号")
+bool showMATrendFilterInput = input.bool(false, "启用 MA 趋势过滤", group="信号过滤",
+    tooltip="价格在 MA 上方只显示买点、下方只显示卖点。被过滤信号以灰色显示")
+int  maTrendPeriodInput     = input.int(60,  "MA 趋势周期", minval=20, maxval=250, group="信号过滤",
+    tooltip="均线周期。仅在\"启用 MA 趋势过滤\"时生效")
+
 // ATR 系列（M3 止损计算用，全局作用域，函数内可直接引用）
 float atrCurrent = ta.atr(stopLossAtrPeriodInput)
+
+// MA 趋势值（M4 信号过滤用，全局作用域，函数内可直接引用）
+float maTrendValue = ta.sma(close, maTrendPeriodInput)
 
 // ============================================================
 // 功能1: 包含判断 - hasContainment()
@@ -1015,6 +1028,113 @@ getStopLossForSignal(sType, entryPrice, refPrice, zd, zg, atrValue) =>
         SignalType.S3 => na(zg) ? entryPrice + pctDist : zg
 
 // ============================================================
+// 功能12d: 趋势状态检测 - getTrendState()
+// ============================================================
+
+// @function  基于最近 N 笔的区间比较判断当前趋势状态
+// @param     strokes array<Stroke> - 笔数组
+// @param     lookback int - 比较窗口大小（默认 5）
+// @returns   string - "上升" / "下降" / "盘整"
+//
+// 算法：取最近 lookback 笔的最高高点和最低低点，与之前 lookback 笔比较。
+// - 近期高点 > 前期高点 AND 近期低点 > 前期低点 → "上升"
+// - 近期高点 < 前期高点 AND 近期低点 < 前期低点 → "下降"
+// - 其他 → "盘整"
+getTrendState(strokes, lookback) =>
+    n = strokes.size()
+    if n < lookback * 2
+        "盘整"
+
+    count = math.min(lookback, math.floor(n / 2))
+    recentStart = n - count
+
+    // 近期区间
+    recentHigh = -1e18
+    recentLow  =  1e18
+    for i = recentStart to n - 1
+        [sLow, sHigh] = getStrokeRange(strokes.get(i))
+        recentHigh := math.max(recentHigh, sHigh)
+        recentLow  := math.min(recentLow, sLow)
+
+    // 前期区间
+    priorStart = math.max(0, recentStart - count)
+    priorEnd   = recentStart - 1
+    priorHigh  = -1e18
+    priorLow   =  1e18
+    for i = priorStart to priorEnd
+        [sLow, sHigh] = getStrokeRange(strokes.get(i))
+        priorHigh := math.max(priorHigh, sHigh)
+        priorLow  := math.min(priorLow, sLow)
+
+    if recentHigh > priorHigh and recentLow > priorLow
+        "上升"
+    else if recentHigh < priorHigh and recentLow < priorLow
+        "下降"
+    else
+        "盘整"
+
+// ============================================================
+// 功能12e: 信号质量评分 - scoreSignal()
+// ============================================================
+
+// @function  计算信号的综合质量评分（0-100）
+// @param     sType SignalType - 信号类型
+// @param     refIndex int - 关联索引（B1/S1=笔索引, B3/S3=中枢索引, B2/S2=B1笔索引）
+// @param     barIndex int - 信号 bar 索引（用于定位相关中枢）
+// @param     trendBCSignals array<BeiChiSignal> - 趋势背驰信号（查 areaRatio）
+// @param     zhongShuList array<ZhongShu> - 中枢列表（查成熟度）
+// @param     trendState string - 预计算的趋势状态
+// @returns   int - 质量评分 0-100
+//
+// 评分因子（加权）：
+//   - 背驰强度 45%：areaRatio < 0.3→100, < 0.5→80, < 0.7→50, < 0.9→20, ≥ 0.9→0
+//     B2/B3/S2/S3 无背驰数据 → 默认 50（中性）
+//   - 中枢成熟度 25%：中枢笔数 7+→100, 5-6→60, 4→40, 3→30
+//   - 趋势一致性 30%：顺势→100, 盘整→50, 逆势→20
+scoreSignal(sType, refIndex, barIndex, trendBCSignals, zhongShuList, trendState) =>
+    // 因子1: 背驰强度（仅 B1/S1 有 BeiChiSignal）
+    bcScore = 50
+    if sType == SignalType.B1 or sType == SignalType.S1
+        targetType = sType == SignalType.B1 ? BeiChiType.BOTTOM : BeiChiType.TOP
+        for bc in trendBCSignals
+            if bc.bcType == targetType and bc.strokeIndex == refIndex
+                ar = bc.areaRatio
+                if ar < 0.3
+                    bcScore := 100
+                else if ar < 0.5
+                    bcScore := 80
+                else if ar < 0.7
+                    bcScore := 50
+                else if ar < 0.9
+                    bcScore := 20
+                else
+                    bcScore := 0
+                break
+
+    // 因子2: 中枢成熟度（信号 barIndex 之前最后一个中枢的笔数）
+    zsStrokeCount = 3
+    for zs in zhongShuList
+        if zs.endOrigIndex <= barIndex
+            zsStrokeCount := zs.strokeCount
+    zsScore = zsStrokeCount >= 7 ? 100 :
+              zsStrokeCount >= 5 ? 60  :
+              zsStrokeCount >= 4 ? 40  : 30
+
+    // 因子3: 趋势一致性
+    isBuy = sType == SignalType.B1 or sType == SignalType.B2 or sType == SignalType.B3
+    trendScore = 50
+    if trendState == "上升" and isBuy
+        trendScore := 100
+    else if trendState == "下降" and not isBuy
+        trendScore := 100
+    else if trendState == "上升" and not isBuy
+        trendScore := 20
+    else if trendState == "下降" and isBuy
+        trendScore := 20
+
+    math.round(bcScore * 0.45 + zsScore * 0.25 + trendScore * 0.30)
+
+// ============================================================
 // 功能13: 实时预判计算 - computePredictions()
 // ============================================================
 
@@ -1606,6 +1726,11 @@ if needFullRebuild
         oldLabel.delete()
     signalLabels.clear()
 
+    // M4: 趋势状态（依赖 strokes，循环中不变，只算一次）
+    string trendState = "盘整"
+    if showSignalQualityInput
+        trendState := getTrendState(strokes, 5)
+
     for sig in allFilteredSignals
         // 买点/卖点总开关
         isBuy  = sig.sType == SignalType.B1 or sig.sType == SignalType.B2 or sig.sType == SignalType.B3
@@ -1628,46 +1753,88 @@ if needFullRebuild
 
         sigStyle = isBuy ? label.style_label_up : label.style_label_down
 
-        // M3: 计算止损价
-        float slPrice = na
-        if showStopLossInput
-            refPrice = switch sig.sType
-                SignalType.B2 =>
-                    float b1Price = na
-                    for fs in firstSignals
-                        if fs.sType == SignalType.B1 and fs.refIndex == sig.refIndex
-                            b1Price := fs.price
-                            break
-                    b1Price
-                SignalType.S2 =>
-                    float s1Price = na
-                    for fs in firstSignals
-                        if fs.sType == SignalType.S1 and fs.refIndex == sig.refIndex
-                            s1Price := fs.price
-                            break
-                    s1Price
-                => float(na)
+        // M4: 信号质量评分
+        int qualityScore = 0
+        if showSignalQualityInput
+            qualityScore := scoreSignal(sig.sType, sig.refIndex, sig.barIndex,
+              trendBeiChiSignals, zhongShuList, trendState)
 
-            zd = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).zd : na
-            zg = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).zg : na
+        // M4: MA 趋势过滤
+        bool maFiltered = false
+        if showMATrendFilterInput
+            if (isBuy and close <= maTrendValue) or (isSell and close >= maTrendValue)
+                maFiltered := true
 
-            slPrice := getStopLossForSignal(sig.sType, sig.price, refPrice, zd, zg, atrCurrent)
+        // M4: 颜色覆盖（MA 过滤 → 整体变灰）
+        if maFiltered
+            sigColor := color.new(color.gray, 50)
 
-        labelText = sig.description
-        if showStopLossInput and not na(slPrice)
-            labelText := str.format("{0}\n止损 {1,number,#.##}", sig.description, slPrice)
+        // M4: 最低质量阈值 + MA 过滤守卫
+        bool shouldRender = true
+        if showSignalQualityInput and minSignalQualityInput > 0 and qualityScore < minSignalQualityInput
+            shouldRender := false
 
-        sigLabel = label.new(
-          sigTime,
-          sigPrice,
-          labelText,
-          color=sigColor,
-          textcolor=color.white,
-          style=sigStyle,
-          size=size.small,
-          xloc=xloc.bar_time
-        )
-        signalLabels.push(sigLabel)
+        if shouldRender
+            // M3: 计算止损价
+            float slPrice = na
+            if showStopLossInput
+                refPrice = switch sig.sType
+                    SignalType.B2 =>
+                        float b1Price = na
+                        for fs in firstSignals
+                            if fs.sType == SignalType.B1 and fs.refIndex == sig.refIndex
+                                b1Price := fs.price
+                                break
+                        b1Price
+                    SignalType.S2 =>
+                        float s1Price = na
+                        for fs in firstSignals
+                            if fs.sType == SignalType.S1 and fs.refIndex == sig.refIndex
+                                s1Price := fs.price
+                                break
+                        s1Price
+                    => float(na)
+
+                zd = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).zd : na
+                zg = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).zg : na
+
+                slPrice := getStopLossForSignal(sig.sType, sig.price, refPrice, zd, zg, atrCurrent)
+
+            // M3+M4: 构建标签文字
+            sigTypeName = switch sig.sType
+                SignalType.B1 => "B1"
+                SignalType.B2 => "B2"
+                SignalType.B3 => "B3"
+                SignalType.S1 => "S1"
+                SignalType.S2 => "S2"
+                SignalType.S3 => "S3"
+
+            // 第一行：信号类型 [+ ★评分] [+ MA过滤标记]
+            string line1 = sigTypeName
+            if showSignalQualityInput
+                line1 := str.format("★{0} {1}", qualityScore, sigTypeName)
+            if maFiltered
+                line1 := str.format("{0} [MA过滤]", line1)
+
+            // 第二行：价格
+            string line2 = str.tostring(math.round_to_mintick(sig.price))
+
+            // 组装
+            labelText = str.format("{0}\n{1}", line1, line2)
+            if showStopLossInput and not na(slPrice)
+                labelText := str.format("{0}\n止损 {1,number,#.##}", labelText, slPrice)
+
+            sigLabel = label.new(
+              sigTime,
+              sigPrice,
+              labelText,
+              color=sigColor,
+              textcolor=color.white,
+              style=sigStyle,
+              size=size.small,
+              xloc=xloc.bar_time
+            )
+            signalLabels.push(sigLabel)
 
 // --- 4c. 分型文字标签 ---
 // 策略：与笔线/中枢/背驰/信号标签一致，needFullRebuild 时删除重建。
