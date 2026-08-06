@@ -1,5 +1,5 @@
 //@version=6
-// 缠论核心 v0.8.0 - M6: 实时预判引擎
+// 缠论核心 v1.2.0 - M1-M6: 笔构建重写（两阶段扫描）+ 全链路缠论
 // 遵循禅师原文"教你炒股票"系列定义
 
 indicator("缠论 - 分型与笔 [Chanlun Core]", "缠论核心", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
@@ -161,13 +161,15 @@ type Prediction
 // INPUT PARAMETERS
 // ============================================================
 
-// 调试开关：显示包含处理过程
+// 调试开关（默认关闭，测试用）
 bool showContainmentDebug = input.bool(false, "显示包含处理过程", group="调试", tooltip="开启后高亮被合并的K线，显示合并前后对比")
 bool showFractalLabels    = input.bool(true,  "显示分型文字标签",  group="调试", tooltip="显示顶/底分型的文字标签。关闭后只保留三角标记")
+bool showBuildBiDebugInput = input.bool(false, "显示 buildBi 诊断日志", group="调试",
+    tooltip="在 needFullRebuild 时打印 buildBi 两阶段扫描的诊断日志，用于验证笔构建逻辑。默认关闭，测试场景 A/B/C 时开启")
 
 // --- 笔设置 (M2) ---
-int   minBarsForBiInput     = input.int(3,    "笔最少K线数 (含分型)", minval=2, maxval=10, group="笔设置",
-    tooltip="每笔至少跨越的原始K线数量，含两端分型K线。禅师原文要求≥3")
+int   minBarsForBiInput     = input.int(5,    "笔最少K线数 (含分型)", minval=2, maxval=10, group="笔设置",
+    tooltip="每笔至少跨越的处理后K线数（无包含关系），含两端分型K线。禅师原文要求≥5。ETF/分钟图可放宽至3-4")
 float minBiPriceChangeInput = input.float(0.0, "笔最小价格变化 (%)", minval=0.0, maxval=20.0, step=0.1, group="笔设置",
     tooltip="过滤价格变化不足的噪音笔，0=不过滤。建议 A股个股 0.5-1.0%，ETF 0.2-0.5%")
 bool  showBiLabelInput      = input.bool(false, "显示笔信息标签", group="笔设置",
@@ -389,97 +391,115 @@ identifyFractals(mergedBars) =>
     fractals
 
 // ============================================================
-// 功能2c: 分型交替过滤 - filterAlternatingFractals()
-// ============================================================
-
-// @function  过滤分型，确保顶底严格交替
-// @param     fractals array<Fractal> - 原始检测到的分型数组（可能含连续同向分型）
-// @returns   array<Fractal> - 交替的分型数组（顶→底→顶→底 严格交替）
-//
-// 策略（禅师原文）：
-// - 连续两个顶分型 → 保留高点更高的那个（"取其中高点较高者"）
-// - 连续两个底分型 → 保留低点更低的那个（"取其中低点较低者"）
-// - 顶底交替 → 全部保留
-filterAlternatingFractals(fractals) =>
-    filtered = array.new<Fractal>()
-    n = fractals.size()
-    if n == 0
-        filtered
-    else
-        array.push(filtered, fractals.get(0))
-
-        if n > 1
-            for i = 1 to n - 1
-                prev = array.last(filtered)
-                curr = fractals.get(i)
-
-                if prev.fType == curr.fType
-                    // 同向分型：保留更极端的那个
-                    if curr.fType == FractalType.TOP and curr.price > prev.price
-                        array.set(filtered, array.size(filtered) - 1, curr)
-                    else if curr.fType == FractalType.BOTTOM and curr.price < prev.price
-                        array.set(filtered, array.size(filtered) - 1, curr)
-                    // 否则丢弃当前分型（保持前一个更极端的）
-                else
-                    array.push(filtered, curr)
-
-        filtered
-
-// ============================================================
 // 功能3: 笔构建 - buildBi()
 // ============================================================
 
-// @function  从交替分型序列构建笔序列
-// @param     fractals - M1 输出的交替分型数组 (顶→底→顶→底)
-// @param     minBars - 每笔至少跨越的原始K线数（含两端分型K线）
-// @param     minPriceChangePct - 最小价格变化百分比（0 = 不过滤）
-// @returns   array<Stroke> - 过滤后的笔数组
+// @function  从原始分型序列构建笔序列（两阶段扫描：定起点 + 定终点）
+// @param     rawFractals array<Fractal> - 原始分型数组（未经交替过滤）
+// @param     minMergedBars int - 每笔至少跨越的处理后K线数
+// @param     minPriceChangePct float - 最小价格变化百分比（0 = 不过滤）
+// @returns   array<Stroke> - 笔数组
 //
-// 算法（禅师原文思路的简化实现）：
-// 从第一个分型开始作为起点，向后扫描找到第一个满足条件的反向分型作为终点。
-// - K线数 = endFractal.originalIndex - startFractal.originalIndex + 1（原始K线，非合并后）
-// - 同向分型自动跳过（continue），K线数不足的也被跳过
-// - 不需要回溯、不需要删分型——跳过的分型就是被过滤掉的噪音
-// 时间复杂度：O(n²) 最坏，实际远小于 n²（找到有效终点即停止，而非全量扫描）
-buildBi(fractals, minBars, minPriceChangePct) =>
+// 间距计算：直接使用分型的 barIndex（合并后 K 线索引）相减。
+// barIndex 由 identifyFractals() 在创建分型时从 mergedBars 的索引赋值，
+// 天然是合并后 K 线位置，无需映射表或额外传参。
+//
+// 两阶段算法（修正单趟扫描的"起点动态竞争"缺陷）：
+//   阶段1 定起点：连续替换更极端的同向分型，直到第一个反向分型为止
+//   阶段2 定终点：从起点之后第一个反向分型起，选评分最高的合格终点，
+//                 遇到同向分型即终止（终点不能越过同向分型）
+//
+// 关键语义：起点一旦确定（阶段1结束），bestStart 不再变化。
+// 这消除了两个单趟扫描的缺陷：
+//   1. 时间倒置笔——单趟中 bestStart 被替换后 bestEnd 未重置，可能产生
+//      startOrigIndex > endOrigIndex 的反向笔
+//   2. 场景 C 无法实现——单趟中 B1 被更极端的 B2"取代"而非"跳过"，
+//      T1→B2 永远无法成为笔
+//
+// 已成之笔绝不因后续更极端的同向分型被回溯删除。
+// B1(bar5)→T1(bar10,合格)→B2(bar15,更极端)→T2(bar25) 输出 3 笔
+// （B1→T1、T1→B2、B2→T2）——B2 更低不否定 B1→T1，它只是下一笔的起点。
+//
+// 时间复杂度：O(n²)，n = 原始分型数
+buildBi(rawFractals, minMergedBars, minPriceChangePct) =>
     strokes = array.new<Stroke>()
-    n = fractals.size()
+    n = rawFractals.size()
     if n < 2
         strokes
 
+    if showBuildBiDebugInput
+        log.info("[buildBi] n={0} minMergedBars={1}", n, minMergedBars)
+
+    roundIdx = 0
     startIdx = 0
     while startIdx < n - 1
-        startFractal = fractals.get(startIdx)
-        found = false
+        if showBuildBiDebugInput
+            log.info("[buildBi] round#{0} startIdx={1}", roundIdx, startIdx)
 
-        // 从 startIdx+1 向后找第一个能构成有效笔的反向分型
-        for j = startIdx + 1 to n - 1
-            endFractal = fractals.get(j)
-
-            // 必须是反向分型（底→顶 或 顶→底）
-            if endFractal.fType == startFractal.fType
-                continue
-
-            barGap = endFractal.originalIndex - startFractal.originalIndex + 1
-            priceChg = math.abs(endFractal.price - startFractal.price)
-            priceChgPct = priceChg / startFractal.price * 100.0
-
-            validGap = barGap >= minBars
-            validPrice = minPriceChangePct <= 0 or priceChgPct >= minPriceChangePct
-
-            if validGap and validPrice
-                dir = startFractal.fType == FractalType.BOTTOM ? StrokeDirection.UP : StrokeDirection.DOWN
-                strokes.push(Stroke.new(
-                  startFractal.originalIndex, endFractal.originalIndex,
-                  startFractal.price, endFractal.price,
-                  dir, barGap, priceChg, priceChgPct
-                ))
-                startIdx := j  // 从这个终点继续
-                found := true
+        // 阶段1：确定起点——连续替换更极端的同向分型，直到第一个反向分型
+        bestStart = rawFractals.get(startIdx)
+        if showBuildBiDebugInput
+            log.info("[buildBi]   phase1: start=bar{0}({1}@{2,number,#.#})", bestStart.barIndex, (bestStart.fType == FractalType.TOP ? "TOP" : "BOTTOM"), bestStart.price)
+        j = startIdx + 1
+        while j < n
+            currF = rawFractals.get(j)
+            if currF.fType == bestStart.fType
+                isMoreExtreme = ((currF.fType == FractalType.TOP and currF.price > bestStart.price) or
+                                 (currF.fType == FractalType.BOTTOM and currF.price < bestStart.price))
+                if isMoreExtreme
+                    bestStart := currF
+                    if showBuildBiDebugInput
+                        log.info("[buildBi]   phase1: bar{0}({1}@{2,number,#.#}) 同向更极端 → 替换起点", currF.barIndex, (currF.fType == FractalType.TOP ? "TOP" : "BOTTOM"), currF.price)
+                j := j + 1
+            else
+                if showBuildBiDebugInput
+                    log.info("[buildBi]   phase1: bar{0}({1}@{2,number,#.#}) 反向 → 起点确定", currF.barIndex, (currF.fType == FractalType.TOP ? "TOP" : "BOTTOM"), currF.price)
                 break
+        if j >= n
+            if showBuildBiDebugInput
+                log.info("[buildBi]   起点后无反向分型，无法成笔")
+            break
 
-        if not found
-            break  // 找不到有效的下一个反向分型，结束
+        // 阶段2：确定终点——选评分最高的反向分型，遇同向分型即终止
+        bestEndIdx = -1
+        bestScore = -1e18
+        k = j
+        while k < n
+            kF = rawFractals.get(k)
+            if kF.fType == bestStart.fType
+                if showBuildBiDebugInput
+                    log.info("[buildBi]   phase2: candidate bar{0}({1}@{2,number,#.#}) same-type → 阶段2终止", kF.barIndex, (kF.fType == FractalType.TOP ? "TOP" : "BOTTOM"), kF.price)
+                break
+            kGap = kF.barIndex - bestStart.barIndex + 1
+            kChgPct = math.abs(kF.price - bestStart.price) / bestStart.price * 100.0
+            kValid = kGap >= minMergedBars and (minPriceChangePct <= 0 or kChgPct >= minPriceChangePct)
+            if showBuildBiDebugInput
+                log.info("[buildBi]   phase2: candidate bar{0}({1}@{2,number,#.#}) mergedGap={3} {4} priceChgPct={5,number,#.#}", kF.barIndex, (kF.fType == FractalType.TOP ? "TOP" : "BOTTOM"), kF.price, kGap, (kValid ? "valid" : "invalid"), kChgPct)
+            if kValid
+                if kChgPct > bestScore
+                    bestScore := kChgPct
+                    bestEndIdx := k
+            k := k + 1
+
+        if bestEndIdx < 0
+            if showBuildBiDebugInput
+                log.info("[buildBi]   round#{0} 无合格终点 → 孤立跳过", roundIdx)
+            startIdx := startIdx + 1  // 孤立跳过，不终止
+            roundIdx := roundIdx + 1
+            continue
+
+        bestEnd = rawFractals.get(bestEndIdx)
+        if showBuildBiDebugInput
+            log.info("[buildBi]   bestEnd=bar{0} priceChgPct={1,number,#.#}", bestEnd.barIndex, bestScore)
+        rawGap = bestEnd.originalIndex - bestStart.originalIndex + 1
+        dir = bestStart.fType == FractalType.BOTTOM ? StrokeDirection.UP : StrokeDirection.DOWN
+        chg = math.abs(bestEnd.price - bestStart.price)
+        chgPct = chg / bestStart.price * 100.0
+        strokes.push(Stroke.new(bestStart.originalIndex, bestEnd.originalIndex, bestStart.price, bestEnd.price, dir, rawGap, chg, chgPct))
+        if showBuildBiDebugInput
+            log.info("[buildBi]   stroke#{0}: bar{1}→bar{2} {3} rawGap={4} priceChgPct={5,number,#.#}", strokes.size() - 1, bestStart.barIndex, bestEnd.barIndex, (dir == StrokeDirection.UP ? "UP" : "DOWN"), rawGap, chgPct)
+        startIdx := bestEndIdx
+        roundIdx := roundIdx + 1
 
     strokes
 
@@ -1365,7 +1385,7 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
 // --- 持久化数据 ---
 // mergedBars: 包含处理后的K线序列，增量构建
 // mergedHighMap / mergedLowMap / mergedCountMap: 原始 bar_index → 合并后属性的映射表
-// fractals: 交替后的分型序列
+// fractals: 原始分型序列（未经交替过滤，仅用于 plotshape 三角标记和文字标签）
 var array<MergedBar> mergedBars      = array.new<MergedBar>()
 var array<float>    mergedHighMap    = array.new<float>()
 var array<float>    mergedLowMap     = array.new<float>()
@@ -1435,16 +1455,16 @@ if needFullRebuild
             mergedLowMap.push(mb.low)
             mergedCountMap.push(mb.mergedCount)
 
-    // 识别所有分型 → 顶底交替过滤
+    // 识别所有分型 → 不再预过滤（同向分型处理已内化到 buildBi）
     rawFractals = identifyFractals(mergedBars)
-    filteredFractals = filterAlternatingFractals(rawFractals)
 
+    // fractals 数组仅用于 plotshape 分型三角标记，使用原始分型即可
     fractals.clear()
-    for f in filteredFractals
+    for f in rawFractals
         fractals.push(f)
 
-    // 从分型序列构建笔序列（消费 M1 输出）
-    newStrokes = buildBi(fractals, minBarsForBiInput, minBiPriceChangeInput)
+    // 从分型序列构建笔序列（消费 M1 输出，原始分型直接进入 buildBi）
+    newStrokes = buildBi(rawFractals, minBarsForBiInput, minBiPriceChangeInput)
     strokes.clear()
     for s in newStrokes
         strokes.push(s)
@@ -2110,14 +2130,14 @@ if barstate.islastconfirmedhistory
     log.info("  买点: B1={0} B2={1} B3={2} | 卖点: S1={3} S2={4} S3={5}",
              b1Count, b2Count, b3Count, s1Count, s2Count, s3Count)
 
-    // 验证顶底交替（TDD 关键检查点）
-    altOk = true
+    // 统计连续同向分型（原始分型允许同向——这是修复后的设计意图，
+    // 分型交替不再是全局不变量，同向选择已内化到 buildBi() 内部）
+    sameAdjacent = 0
     for j = 1 to fractals.size() - 1
         if fractals.get(j).fType == fractals.get(j - 1).fType
-            altOk := false
-            log.error("分型交替异常: 索引 {0} 和 {1} 同向", j-1, j)
-    if altOk and fractalCount > 0
-        log.info("  ✓ 分型交替检查通过（顶底严格交替）")
+            sameAdjacent += 1
+    if fractalCount > 0
+        log.info("  连续同向分型: {0} 对（同向选择由 buildBi 处理）", sameAdjacent)
 
     // 验证笔方向交替（M2 TDD 检查点）
     biAltOk = true
@@ -2127,6 +2147,16 @@ if barstate.islastconfirmedhistory
             log.error("笔方向交替异常: 索引 {0} 和 {1} 同向", j-1, j)
     if biAltOk and strokeCount > 0
         log.info("  ✓ 笔方向交替检查通过")
+
+    // 验证笔时间顺序（防御回归：两阶段算法保证 startOrigIndex < endOrigIndex，
+    // 但日志段必须能捕获未来任何破坏此不变量的改动）
+    timeOrderOk = true
+    for j = 0 to strokes.size() - 1
+        if strokes.get(j).startOrigIndex >= strokes.get(j).endOrigIndex
+            timeOrderOk := false
+            log.error("笔时间顺序异常: 索引 {0} start={1} end={2}", j, strokes.get(j).startOrigIndex, strokes.get(j).endOrigIndex)
+    if timeOrderOk and strokeCount > 0
+        log.info("  ✓ 笔时间顺序检查通过（startOrigIndex < endOrigIndex）")
 
     // 验证中枢合法性（M3 TDD 检查点）
     zsOk = true

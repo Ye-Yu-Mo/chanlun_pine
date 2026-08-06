@@ -1,1 +1,7 @@
 *.md
+.mcp.json
+mcp-test/pine_ref_test.py
+mcp-test/pyproject.toml
+mcp-test/run_test.sh
+mcp-test/test_mcp.py
+mcp-test/uv.lock
