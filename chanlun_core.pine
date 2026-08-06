@@ -86,6 +86,8 @@ type Stroke
 // @field dd              区间最低 DD = min(构成中枢各笔的低点)
 // @field strokeCount     构成中枢的笔数（≥3）
 // @field startDir        进入中枢的方向（第一笔的方向）
+// @field initialZG       中枢形成时（前三笔）的 ZG，延伸后不变——信号/预判/止损用
+// @field initialZD       中枢形成时（前三笔）的 ZD，延伸后不变——信号/预判/止损用
 type ZhongShu
     int             startStrokeIdx
     int             endStrokeIdx
@@ -97,6 +99,8 @@ type ZhongShu
     float           dd
     int             strokeCount
     StrokeDirection startDir
+    float           initialZG  // 前三笔形成中枢时的 ZG，延伸后不变
+    float           initialZD  // 前三笔形成中枢时的 ZD，延伸后不变
 
 // @description 背驰类型：顶背驰（向上趋势末端）或底背驰（向下趋势末端）
 enum BeiChiType
@@ -484,7 +488,16 @@ buildBi(rawFractals, minMergedBars, minPriceChangePct) =>
         if bestEndIdx < 0
             if showBuildBiDebugInput
                 log.info("[buildBi]   round#{0} 无合格终点 → 孤立跳过", roundIdx)
-            startIdx := startIdx + 1  // 孤立跳过，不终止
+            // 孤立跳过：新起点必须保持与上一笔终点同类型，保证笔方向严格交替。
+            // 否则 B1→T1(UP) 后 T1→B2 不成笔，B2(底) 直接成为新起点会产生同向 UP 笔，
+            // 违反缠论"笔方向严格交替"硬约束（T1→B2 间距不足被过滤的真实场景）。
+            if strokes.size() > 0
+                targetType = strokes.last().dir == StrokeDirection.UP ? FractalType.TOP : FractalType.BOTTOM
+                startIdx := startIdx + 1
+                while startIdx < n and rawFractals.get(startIdx).fType != targetType
+                    startIdx := startIdx + 1
+            else
+                startIdx := startIdx + 1  // 首笔之前无类型约束，正常前进
             roundIdx := roundIdx + 1
             continue
 
@@ -578,6 +591,10 @@ identifyZhongShu(strokes, minStrokes, minWidthPct) =>
                 i := i + 1
                 continue
 
+            // 记录初始核心边界（前三笔，延伸后不变）
+            initialZG = zg
+            initialZD = zd
+
             // 阶段2：向前延伸
             endIdx = i + 2
             j = i + 3
@@ -599,16 +616,19 @@ identifyZhongShu(strokes, minStrokes, minWidthPct) =>
                 else
                     break
 
-            // 保存中枢
+            // 保存中枢（strokeCount 达标才保存）
             startStroke = strokes.get(i)
             endStroke = strokes.get(endIdx)
-            zhongShuList.push(ZhongShu.new(
-              i, endIdx,
-              startStroke.startOrigIndex, endStroke.endOrigIndex,
-              zg, zd, gg, dd,
-              endIdx - i + 1,
-              startStroke.dir
-            ))
+            strokeCount = endIdx - i + 1
+            if strokeCount >= minStrokes
+                zhongShuList.push(ZhongShu.new(
+                  i, endIdx,
+                  startStroke.startOrigIndex, endStroke.endOrigIndex,
+                  zg, zd, gg, dd,
+                  strokeCount,
+                  startStroke.dir,
+                  initialZG, initialZD
+                ))
 
             // 中枢之间至少隔一笔，不共享边界笔。
             // 否则相邻中枢共享 stroke[endIdx] 会导致趋势背驰的进入段/离开段
@@ -876,23 +896,23 @@ detectThirdSignals(strokes, zhongShuList) =>
         // B3: 向上离开 → 向下回调 → 不破 ZG
         if leaveStroke.dir == StrokeDirection.UP and pullbackStroke.dir == StrokeDirection.DOWN
             [pbLow, pbHigh] = getStrokeRange(pullbackStroke)
-            if pbLow > zs.zg
+            if pbLow > zs.initialZG
                 signals.push(TradingSignal.new(
                   pullbackStroke.endOrigIndex,
                   pullbackStroke.endPrice,
                   SignalType.B3, zsIdx,
-                  str.format("B3\n>{0,number,#.##}", zs.zg)
+                  str.format("B3\n>{0,number,#.##}", zs.initialZG)
                 ))
 
         // S3: 向下离开 → 向上反弹 → 不破 ZD
         if leaveStroke.dir == StrokeDirection.DOWN and pullbackStroke.dir == StrokeDirection.UP
             [pbLow, pbHigh] = getStrokeRange(pullbackStroke)
-            if pbHigh < zs.zd
+            if pbHigh < zs.initialZD
                 signals.push(TradingSignal.new(
                   pullbackStroke.endOrigIndex,
                   pullbackStroke.endPrice,
                   SignalType.S3, zsIdx,
-                  str.format("S3\n<{0,number,#.##}", zs.zd)
+                  str.format("S3\n<{0,number,#.##}", zs.initialZD)
                 ))
 
     signals
@@ -1219,7 +1239,7 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
             lastStrokeIdx = strokes.size() - 1
             if lastStrokeIdx <= lastZS.endStrokeIdx and lastZS.startStrokeIdx > 0
                 refStroke = strokes.get(lastZS.startStrokeIdx - 1)
-                if refStroke.dir == StrokeDirection.DOWN and low < lastZS.zd
+                if refStroke.dir == StrokeDirection.DOWN and low < lastZS.initialZD
                     triggerPrice = refStroke.endPrice
                     predictions.push(Prediction.new(
                       "B1", triggerPrice,
@@ -1267,7 +1287,7 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
 
                 // realtime 感知：价格已向上突破 ZG，离开段正在形成
                 else if lastStrokeIdx <= lastZS.endStrokeIdx
-                    if high > lastZS.zg and refStroke.dir == StrokeDirection.UP
+                    if high > lastZS.initialZG and refStroke.dir == StrokeDirection.UP
                         predictions.push(Prediction.new(
                           "S1", refStroke.endPrice,
                           str.format("向上离开中枢 + 突破{0,number,#.##} + MACD背驰 → S1", refStroke.endPrice),
@@ -1289,7 +1309,7 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
             leaveStroke = strokes.get(leaveIdx)
 
             // B3: 向上离开 + 价格仍在 ZG 上方
-            if leaveStroke.dir == StrokeDirection.UP and close > lastZS.zg
+            if leaveStroke.dir == StrokeDirection.UP and close > lastZS.initialZG
                 statusText = ""
                 if isSignalTriggered(SignalType.B3, zsIdx, allFilteredSignals)
                     statusText := "✅ 已触发"
@@ -1297,15 +1317,15 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
                     statusText := "⏳ 等待中"
 
                 predictions.push(Prediction.new(
-                  "B3", lastZS.zg,
-                  str.format("回调不破ZG={0,number,#.##} → B3", lastZS.zg),
+                  "B3", lastZS.initialZG,
+                  str.format("回调不破ZG={0,number,#.##} → B3", lastZS.initialZG),
                   "DOWN",
                   statusText,
-                  getStopLossForSignal(SignalType.B3, lastZS.zg, float(na), lastZS.zd, lastZS.zg, atrCurrent)
+                  getStopLossForSignal(SignalType.B3, lastZS.initialZG, float(na), lastZS.initialZD, lastZS.initialZG, atrCurrent)
                 ))
 
             // S3: 向下离开 + 价格仍在 ZD 下方
-            if leaveStroke.dir == StrokeDirection.DOWN and close < lastZS.zd
+            if leaveStroke.dir == StrokeDirection.DOWN and close < lastZS.initialZD
                 statusText = ""
                 if isSignalTriggered(SignalType.S3, zsIdx, allFilteredSignals)
                     statusText := "✅ 已触发"
@@ -1313,11 +1333,11 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
                     statusText := "⏳ 等待中"
 
                 predictions.push(Prediction.new(
-                  "S3", lastZS.zd,
-                  str.format("反弹不破ZD={0,number,#.##} → S3", lastZS.zd),
+                  "S3", lastZS.initialZD,
+                  str.format("反弹不破ZD={0,number,#.##} → S3", lastZS.initialZD),
                   "UP",
                   statusText,
-                  getStopLossForSignal(SignalType.S3, lastZS.zd, float(na), lastZS.zd, lastZS.zg, atrCurrent)
+                  getStopLossForSignal(SignalType.S3, lastZS.initialZD, float(na), lastZS.initialZD, lastZS.initialZG, atrCurrent)
                 ))
 
     // --- B2: B1 后的二次买入预判 ---
@@ -1815,8 +1835,8 @@ if needFullRebuild
                         s1Price
                     => float(na)
 
-                zd = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).zd : na
-                zg = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).zg : na
+                zd = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).initialZD : na
+                zg = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).initialZG : na
 
                 slPrice := getStopLossForSignal(sig.sType, sig.price, refPrice, zd, zg, atrCurrent)
 
